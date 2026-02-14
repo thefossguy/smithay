@@ -12,6 +12,8 @@ use std::{
     thread,
 };
 
+use rand::RngCore;
+use tracing::warn;
 use tracing::{error, info, trace};
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use wayland_server::{Client, DisplayHandle};
@@ -79,6 +81,9 @@ pub enum XWaylandEvent {
         /// This can be useful to set the `DISPLAY` variable manually when
         /// spawning processes that may use XWayland.
         display_number: u32,
+
+        /// The absolute path for the Xauthority file
+        xauthority_file_path: Option<String>,
     },
 
     /// The XWayland server exited unexpectedly during startup.
@@ -184,6 +189,55 @@ impl XWayland {
             });
         }
 
+        // Try generating an Xauthority file for XWayland
+        let mut xauthority_file_path: Option<String> = None;
+        let xdg_runtime_dir_env = env::var("XDG_RUNTIME_DIR");
+        match xdg_runtime_dir_env {
+            Err(_) => warn!("XDG_RUNTIME_DIR is empty, not attempting to create an Xauthority file"),
+            Ok(xdg_runtime_dir) => {
+                let xauthority_file = format!("{}/.smithay.Xwaylandauth.{}", xdg_runtime_dir, display_number);
+                let xauthority_path = std::path::Path::new(&xauthority_file);
+                let xauthority_path_result = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(xauthority_path);
+                match xauthority_path_result {
+                    Err(_) => warn!("Failed to create an empty Xauthority file at {}", xauthority_file),
+                    Ok(_) => {
+                        let mut xauthority_cookie = [0u8; 16];
+                        rand::thread_rng().fill_bytes(&mut xauthority_cookie);
+                        let xauthority_cookie_hex = xauthority_cookie
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect::<String>();
+                        let xauthority_creation_result = Command::new("xauth")
+                            .arg("-f")
+                            .arg(&xauthority_file)
+                            .arg("add")
+                            .arg(format!(":{}", display_number))
+                            .arg("MIT-MAGIC-COOKIE-1")
+                            .arg(xauthority_cookie_hex)
+                            .output();
+                        match xauthority_creation_result {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    info!("Generated Xauthority file at {}", xauthority_file);
+                                    command.arg("-auth").arg(&xauthority_file);
+                                    command.env("XAUTHORITY", &xauthority_file);
+                                    xauthority_file_path = Some(xauthority_file.clone());
+                                } else {
+                                    warn!("Failed to generate Xauthority file, XWayland may not accept connections from privileged processes");
+                                }
+                            }
+                            Err(_) => {
+                                warn!("Failed to generate Xauthority file, XWayland may not accept connections from privileged processes");
+                            }
+                        };
+                    }
+                };
+            }
+        };
+
         info!("spawning XWayland instance");
 
         let child = command.spawn()?;
@@ -195,6 +249,7 @@ impl XWayland {
             display_lock: lock,
             display_fd: displayfd_recv,
             x11_socket: Some(x_wm_me),
+            xauthority_file_path,
         };
 
         let data_map = UserDataMap::new();
@@ -264,6 +319,7 @@ struct Instance {
     display_lock: X11Lock,
     x11_socket: Option<UnixStream>,
     display_fd: OwnedFd,
+    xauthority_file_path: Option<String>,
 }
 
 impl calloop::EventSource for XWayland {
@@ -298,6 +354,7 @@ impl calloop::EventSource for XWayland {
                 XWaylandEvent::Ready {
                     x11_socket,
                     display_number: guard.display_lock.display_number(),
+                    xauthority_file_path: guard.xauthority_file_path.clone(),
                 },
                 &mut (),
             );
